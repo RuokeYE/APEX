@@ -1,20 +1,35 @@
-import numpy as np
 from abc import ABC, abstractmethod
+from typing import Dict, Tuple
+
+import numpy as np
+import pandas as pd
 import plotly.graph_objs as go
 from dash import dash_table
-import pandas as pd
 
 from apex.core.lib.utils import round_format, round_2d_format
 
-TABLE_WIDTH = '50%'
-TABLE_MIN_WIDTH = '95%'
+TABLE_WIDTH = "50%"
+TABLE_MIN_WIDTH = "95%"
+TABLE_STYLE = {"width": TABLE_WIDTH, "minWidth": TABLE_MIN_WIDTH, "overflowX": "auto"}
+TABLE_CELL_STYLE = {"textAlign": "left"}
 
 
 def random_color():
     r = np.random.randint(50, 200)
     g = np.random.randint(50, 200)
     b = np.random.randint(50, 200)
-    return f'rgb({r}, {g}, {b})'
+    return f"rgb({r}, {g}, {b})"
+
+
+def build_table(df: pd.DataFrame, cell_style: Dict = None) -> dash_table.DataTable:
+    """Create a dash DataTable with consistent styling."""
+    style_cell = TABLE_CELL_STYLE if cell_style is None else {**TABLE_CELL_STYLE, **cell_style}
+    return dash_table.DataTable(
+        data=df.to_dict("records"),
+        columns=[{"name": i, "id": i} for i in df.columns],
+        style_table=TABLE_STYLE,
+        style_cell=style_cell,
+    )
 
 
 class PropertyReport(ABC):
@@ -39,7 +54,7 @@ class PropertyReport(ABC):
 
     @staticmethod
     @abstractmethod
-    def dash_table(res_data: dict, decimal: int) -> [dash_table.DataTable, pd.DataFrame]:
+    def dash_table(res_data: dict, decimal: int) -> Tuple[dash_table.DataTable, pd.DataFrame]:
         """
         Make Dash table.
 
@@ -101,22 +116,212 @@ class EOSReport(PropertyReport):
         for k, v in res_data.items():
             vpa.append(float(k))
             epa.append(float(v))
-        df = pd.DataFrame({
-            "VpA(A^3)": round_format(vpa, decimal),
-            "EpA(eV)": round_format(epa, decimal)
-        })
-
-        table = dash_table.DataTable(
-            data=df.to_dict('records'),
-            columns=[{'name': i, 'id': i} for i in df.columns],
-            style_table={'width': TABLE_WIDTH,
-                         'minWidth': TABLE_MIN_WIDTH,
-                         'overflowX': 'auto'},
-            style_cell={'textAlign': 'left'}
+        df = pd.DataFrame(
+            {
+                "VpA(A^3)": round_format(vpa, decimal),
+                "EpA(eV)": round_format(epa, decimal),
+            }
         )
 
-        return table, df
+        return build_table(df), df
 
+
+class CohesiveReport(PropertyReport):
+    @staticmethod
+    def plotly_graph(res_data: dict, name: str, **kwargs):
+        lattice = []
+        epa = []
+        cohesive_energy = []
+        for k, m in res_data.items():
+            lattice.append(float(k))
+            epa.append(float(m["total_energy"]))
+            cohesive_energy.append(float(m["cohesive_energy"]))
+        
+        df = pd.DataFrame({
+            "ScaledLattice": lattice,
+            "TotalEnergy(eV/atom)": epa,
+            "CohesiveEnergy(eV/atom)": cohesive_energy
+        })
+        
+        trace = go.Scatter(
+            name=name,
+            x=df['ScaledLattice'],
+            y=df['CohesiveEnergy(eV/atom)'],
+            mode='lines+markers'
+        )
+        
+        zero_line = go.Scatter(
+            x=[min(lattice), max(lattice)],
+            y=[0, 0],
+            mode='lines',
+            line=dict(color='blue', width=1, dash='dot'),
+            showlegend=False
+        )
+
+        layout = go.Layout(
+            title='Cohesive Energy',
+            xaxis=dict(
+                title_text="Scaled Lattice Parameter a/a<sub>0</sub>",
+                title_font=dict(
+                    size=18,
+                    color="#7f7f7f"
+                ),
+            ),
+            yaxis=dict(
+                title_text="Cohesive Energy E<sub>coh</sub> (eV/atom)",
+                title_font=dict(
+                    size=18,
+                    color="#7f7f7f"
+                ),
+            )
+        )
+        
+        return [trace, zero_line], layout
+
+    @staticmethod
+    def dash_table(res_data: dict, decimal: int = 3, **kwargs) -> dash_table.DataTable:
+        lattice = []
+        epa = []
+        cohesive_energy = []
+        for k, m in res_data.items():
+            lattice.append(float(k))
+            epa.append(float(m["total_energy"]))
+            cohesive_energy.append(float(m["cohesive_energy"]))
+            
+        df = pd.DataFrame(
+            {
+                "Scaled Lattice Parameter (a/a0)": round_format(lattice, decimal),
+                "Total Energy (eV/atom)": round_format(epa, decimal),
+                "Cohesive Energy (eV/atom)": round_format(cohesive_energy, decimal),
+            }
+        )
+
+        return build_table(df), df
+    
+    
+class DecohesiveReport(PropertyReport):
+    @staticmethod
+    def plotly_graph(res_data: dict, name: str, **kwargs):
+        # Sort by separation distance to keep curves monotonic.
+        sorted_vals = sorted(res_data.values(), key=lambda x: float(x[0]))
+        vacuum_size = [float(vals[0]) for vals in sorted_vals]
+        decohesion_e = [float(vals[1]) for vals in sorted_vals]
+        stress = [float(vals[2]) for vals in sorted_vals]
+
+        df = pd.DataFrame(
+            {
+                "Separation Distance (A)": vacuum_size,
+                "Decohesion Energy (J/m^2)": decohesion_e,
+                "Decohesion Stress (GPa)": [s / 1e9 for s in stress],
+            }
+        )
+        trace_E = go.Scatter(
+            name=f"{name} Decohesion Energy",
+            x=df['Separation Distance (A)'],
+            y=df['Decohesion Energy (J/m^2)'],
+            mode='lines+markers',
+            yaxis='y1'
+        )
+
+        trace_S = go.Scatter(
+            name=f"{name} Decohesion Stress",
+            x=df['Separation Distance (A)'],
+            y=df['Decohesion Stress (GPa)'],
+            mode='lines+markers',
+            yaxis='y2'
+        )
+        layout = go.Layout(
+            title=dict(
+                text='Decohesion Energy and Stress',
+                x=0.5,
+                xanchor='center'
+            ),
+            xaxis=dict(
+                title_text="Separation Distance (A)",
+                title_font=dict(
+                    size=18,
+                    color="#7f7f7f"
+                )
+            ),
+            yaxis=dict(
+                title="Decohesion Energy (J/m^2)",
+                title_font=dict(
+                    size=18,
+                    color="#7f7f7f"
+                )
+            ),
+            yaxis2=dict(
+                title="Decohesion Stress (GPa)",
+                title_font=dict(
+                    size=18,
+                    color="#7f7f7f"
+                ),
+                overlaying='y',
+                side='right'
+            )
+        )
+        trace = [trace_E, trace_S]
+        return trace, layout
+
+    @staticmethod
+    def dash_table(res_data: dict, decimal: int = 3, **kwargs) -> dash_table.DataTable:
+        sorted_vals = sorted(res_data.values(), key=lambda x: float(x[0]))
+        vacuum_size = [float(vals[0]) for vals in sorted_vals]
+        decohesion_e = [float(vals[1]) for vals in sorted_vals]
+        stress = [float(vals[2]) for vals in sorted_vals]
+
+        df = pd.DataFrame(
+            {
+                "Separation Distance (A)": round_format(vacuum_size, decimal),
+                "Decohesion Energy (J/m^2)": round_format(decohesion_e, decimal),
+                "Decohesion Stress (GPa)": round_format([s / 1e9 for s in stress], decimal),
+            }
+        )
+
+        return build_table(df), df
+
+
+class FiniteTlattReport(PropertyReport):
+    """Report lattice parameters as a function of temperature."""
+
+    @staticmethod
+    def _sorted_arrays(res_data):
+        # sort by temperature to ensure monotonic curves
+        sorted_vals = sorted(res_data.values(), key=lambda v: float(v[3]))
+        lx = [float(v[0]) for v in sorted_vals]
+        ly = [float(v[1]) for v in sorted_vals]
+        lz = [float(v[2]) for v in sorted_vals]
+        temps = [float(v[3]) for v in sorted_vals]
+        return temps, lx, ly, lz
+
+    @staticmethod
+    def plotly_graph(res_data: dict, name: str, **kwargs):
+        temps, lx, ly, lz = FiniteTlattReport._sorted_arrays(res_data)
+
+        trace_a = go.Scatter(x=temps, y=lx, mode='lines+markers', name='a (lx)', line=dict(color='blue'))
+        trace_b = go.Scatter(x=temps, y=ly, mode='lines+markers', name='b (ly)', line=dict(color='green'))
+        trace_c = go.Scatter(x=temps, y=lz, mode='lines+markers', name='c (lz)', line=dict(color='red'))
+
+        layout = go.Layout(
+            title='Finite Temperature Lattice Parameters',
+            xaxis=dict(title='Temperature (K)'),
+            yaxis=dict(title='Lattice parameter (Å)'),
+            showlegend=True
+        )
+        return [trace_a, trace_b, trace_c], layout
+
+    @staticmethod
+    def dash_table(res_data: dict, decimal: int = 6, **kwargs) -> dash_table.DataTable:
+        temps, lx, ly, lz = FiniteTlattReport._sorted_arrays(res_data)
+        df = pd.DataFrame(
+            {
+                "Temperature (K)": round_format(temps, decimal),
+                "a (Å)": round_format(lx, decimal),
+                "b (Å)": round_format(ly, decimal),
+                "c (Å)": round_format(lz, decimal),
+            }
+        )
+        return build_table(df), df
 
 class ElasticReport(PropertyReport):
     @staticmethod
@@ -175,118 +380,7 @@ class ElasticReport(PropertyReport):
             rounded_tensor,
             columns=['Col 1', 'Col 2', 'Col 3', 'Col 4', 'Col 5', 'Col 6'],
         )
-
-        table = dash_table.DataTable(
-            data=df.to_dict('records'),
-            columns=[{'name': i, 'id': i} for i in df.columns],
-            style_table={'width': TABLE_WIDTH,
-                         'minWidth': TABLE_MIN_WIDTH,
-                         'overflowX': 'auto'},
-            style_cell={'textAlign': 'left', 'width': '150px'}
-        )
-
-        return table, df
-
-
-class CohesiveEnergyReport(PropertyReport):
-    @staticmethod
-    def plotly_graph(res_data: dict, name: str, **kwargs):
-        lattice = []
-        cohesive_energy = []
-        for k, v in res_data.items():
-            lattice.append(float(k))
-            cohesive_energy.append(float(v))
-            
-        # 计算标度化晶格参数 a/a0，假设第一个值为a0
-        a0 = lattice[0] if lattice else 1.0
-        scaled_lattice = [a/a0 for a in lattice]
-        
-        df = pd.DataFrame({
-            "Scaled Lattice Parameter": scaled_lattice,
-            "Cohesive Energy": cohesive_energy
-        })
-        
-        # 设置线型和标记样式
-        line_style = kwargs.get('line_style', 'solid')
-        marker_symbol = kwargs.get('marker_symbol', 'circle')
-        line_color = kwargs.get('line_color', random_color())
-        line_width = kwargs.get('line_width', 2)
-        
-        trace = go.Scatter(
-            name=name,
-            x=df['Scaled Lattice Parameter'],
-            y=df['Cohesive Energy'],
-            mode='lines+markers',
-            line=dict(color=line_color, width=line_width, dash=line_style),
-            marker=dict(symbol=marker_symbol, size=8)
-        )
-        
-        # 添加零能量参考线
-        zero_line = go.Scatter(
-            x=[min(scaled_lattice), max(scaled_lattice)],
-            y=[0, 0],
-            mode='lines',
-            line=dict(color='blue', width=1, dash='dot'),
-            showlegend=False
-        )
-        
-        layout = go.Layout(
-            title='Cohesive Energy',
-            xaxis=dict(
-                title_text="Scaled lattice parameter a/a<sub>0</sub>",
-                title_font=dict(
-                    size=18,
-                    color="#7f7f7f"
-                ),
-                range=[0.5, 2.5]  # 设置x轴范围类似于示例图
-            ),
-            yaxis=dict(
-                title_text="Cohesive energy E<sub>coh</sub> (eV/atom)",
-                title_font=dict(
-                    size=18,
-                    color="#7f7f7f"
-                ),
-                range=[-7, 8]  # 设置y轴范围类似于示例图
-            ),
-            showlegend=True,
-            legend=dict(
-                x=0.7,
-                y=0.9,
-                bgcolor='rgba(255, 255, 255, 0.5)'
-            )
-        )
-        
-        return [trace, zero_line], layout
-
-    @staticmethod
-    def dash_table(res_data: dict, decimal: int = 3, **kwargs) -> dash_table.DataTable:
-        lattice = []
-        cohesive_energy = []
-        for k, v in res_data.items():
-            lattice.append(float(k))
-            cohesive_energy.append(float(v))
-            
-        # 计算标度化晶格参数 a/a0
-        a0 = lattice[0] if lattice else 1.0
-        scaled_lattice = [a/a0 for a in lattice]
-            
-        df = pd.DataFrame({
-            "Lattice Constant (Å)": round_format(lattice, decimal),
-            "Scaled Lattice Parameter (a/a0)": round_format(scaled_lattice, decimal),
-            "Cohesive Energy (eV/atom)": round_format(cohesive_energy, decimal)
-        })
-
-        table = dash_table.DataTable(
-            data=df.to_dict('records'),
-            columns=[{'name': i, 'id': i} for i in df.columns],
-            style_table={'width': TABLE_WIDTH,
-                         'minWidth': TABLE_MIN_WIDTH,
-                         'overflowX': 'auto'},
-            style_cell={'textAlign': 'left'}
-        )
-
-        return table, df
-
+        return build_table(df, cell_style={'width': '150px'}), df
 
 class SurfaceReport(PropertyReport):
     @staticmethod
@@ -342,16 +436,7 @@ class SurfaceReport(PropertyReport):
             "EpA_equi (eV)": round_format(epa_equi, decimal),
         })
 
-        table = dash_table.DataTable(
-            data=df.to_dict('records'),
-            columns=[{'name': i, 'id': i} for i in df.columns],
-            style_table={'width': TABLE_WIDTH,
-                         'minWidth': TABLE_MIN_WIDTH,
-                         'overflowX': 'auto'},
-            style_cell={'textAlign': 'left'}
-        )
-
-        return table, df
+        return build_table(df), df
 
 
 class InterstitialReport(PropertyReport):
@@ -409,16 +494,7 @@ class InterstitialReport(PropertyReport):
             "E_equi (eV)": round_format(equi_e, decimal),
         })
 
-        table = dash_table.DataTable(
-            data=df.to_dict('records'),
-            columns=[{'name': i, 'id': i} for i in df.columns],
-            style_table={'width': TABLE_WIDTH,
-                         'minWidth': TABLE_MIN_WIDTH,
-                         'overflowX': 'auto'},
-            style_cell={'textAlign': 'left'}
-        )
-
-        return table, df
+        return build_table(df), df
 
 
 class VacancyReport(PropertyReport):
@@ -426,8 +502,6 @@ class VacancyReport(PropertyReport):
     def plotly_graph(res_data: dict, name: str, **kwargs):
         v = list(res_data.values())[0]
         vac_form_e = float(v[0])
-        struct_e = float(v[1])
-        equi_e = float(v[2])
 
         bar = go.Bar(
             name=name,
@@ -474,16 +548,7 @@ class VacancyReport(PropertyReport):
             "E_equi (eV)": round_format(equi_e, decimal),
         })
 
-        table = dash_table.DataTable(
-            data=df.to_dict('records'),
-            columns=[{'name': i, 'id': i} for i in df.columns],
-            style_table={'width': TABLE_WIDTH,
-                         'minWidth': TABLE_MIN_WIDTH,
-                         'overflowX': 'auto'},
-            style_cell={'textAlign': 'left'}
-        )
-
-        return table, df
+        return build_table(df), df
 
 
 class GammaReport(PropertyReport):
@@ -492,14 +557,10 @@ class GammaReport(PropertyReport):
         displ = []
         displ_length = []
         fault_en = []
-        struct_en = []
-        equi_en = []
         for k, v in res_data.items():
             displ.append(k)
             displ_length.append(v[0])
             fault_en.append(v[1])
-            struct_en.append((v[2]))
-            equi_en.append(v[3])
         df = pd.DataFrame({
             "displacement": displ,
             "displace_length": displ_length,
@@ -554,16 +615,7 @@ class GammaReport(PropertyReport):
             "E_Equilib (eV)": round_format(equi_en, decimal)
         })
 
-        table = dash_table.DataTable(
-            data=df.to_dict('records'),
-            columns=[{'name': i, 'id': i} for i in df.columns],
-            style_table={'width': TABLE_WIDTH,
-                         'minWidth': TABLE_MIN_WIDTH,
-                         'overflowX': 'auto'},
-            style_cell={'textAlign': 'left'}
-        )
-
-        return table, df
+        return build_table(df), df
 
 
 class PhononReport(PropertyReport):
@@ -708,14 +760,4 @@ class PhononReport(PropertyReport):
 
         df = pd.DataFrame(pd_dict)
 
-        table = dash_table.DataTable(
-            data=df.to_dict('records'),
-            columns=[{'name': i, 'id': i} for i in df.columns],
-            style_table={'width': TABLE_WIDTH,
-                         'minWidth': TABLE_MIN_WIDTH,
-                         'overflowX': 'auto'},
-            style_cell={'textAlign': 'left'}
-        )
-
-        return table, df
-
+        return build_table(df), df

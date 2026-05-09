@@ -21,6 +21,8 @@ REF_MARKER_SIZE = 9
 def return_prop_class(prop_type: str):
     if prop_type == 'eos':
         return EOSReport
+    elif prop_type == 'cohesive':
+        return CohesiveReport
     elif prop_type == 'elastic':
         return ElasticReport
     elif prop_type == 'surface':
@@ -33,6 +35,10 @@ def return_prop_class(prop_type: str):
         return GammaReport
     elif prop_type == 'phonon':
         return PhononReport
+    elif prop_type == 'decohesive':
+        return DecohesiveReport
+    elif prop_type == 'finitetlatt':
+        return FiniteTlattReport
 
 
 def return_prop_type(prop: str):

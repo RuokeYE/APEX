@@ -4,6 +4,7 @@ import glob
 import shutil
 import tempfile
 import logging
+import copy
 from typing import List
 from multiprocessing import Pool
 from monty.serialization import loadfn
@@ -58,6 +59,116 @@ def pack_upload_dir(
         conf_dirs.extend(glob.glob(conf))
     conf_dirs = list(set(conf_dirs))
     conf_dirs.sort()
+
+    def relaxation_finished(conf_path: str) -> bool:
+        res = os.path.join(conf_path, "relaxation", "relax_task", "result.json")
+        return os.path.isfile(res) and os.path.getsize(res) > 0
+
+    def property_finished(conf_path: str, properties: list) -> bool:
+        # finished only if every property that sets rerun_finished=False has its results
+        all_done = True
+        for prop in properties:
+            rerun_finished = prop.get("rerun_finished", True)
+            if rerun_finished:
+                all_done = False
+                break
+            do_refine, suffix = handle_prop_suffix(prop)
+            if not suffix:
+                all_done = False
+                break
+            prop_dir = os.path.join(conf_path, prop["type"] + "_" + suffix)
+            rjson = os.path.join(prop_dir, "result.json")
+            rout = os.path.join(prop_dir, "result.out")
+            if not (os.path.isfile(rjson) and os.path.getsize(rjson) > 0
+                    and os.path.isfile(rout) and os.path.getsize(rout) > 0):
+                all_done = False
+                break
+        return all_done
+
+    # Optional pruning to skip already-finished tasks before upload.
+    if flow_type == 'relax' and relax_param:
+        rerun_finished = relax_param.get("interaction", {}).get("rerun_finished", True)
+        if rerun_finished is False:
+            pruned = []
+            skipped = []
+            for c in conf_dirs:
+                if relaxation_finished(c):
+                    logging.info(f"Skip uploading finished relaxation for {c} (rerun_finished=False).")
+                    skipped.append(c)
+                else:
+                    pruned.append(c)
+            conf_dirs = pruned
+            if not conf_dirs:
+                raise RuntimeError("All relaxations are already finished; nothing to submit.")
+
+    if flow_type == 'props' and prop_param:
+        properties = prop_param.get("properties", [])
+        finished_props = {}
+        pruned = []
+        for c in conf_dirs:
+            done_all = property_finished(c, properties)
+            if done_all:
+                logging.info(f"Skip uploading finished properties for {c} (all rerun_finished=False and results present).")
+            else:
+                pruned.append(c)
+                # track per-structure finished properties
+                finished_list = []
+                for prop in properties:
+                    if not prop.get("rerun_finished", True):
+                        do_refine, suffix = handle_prop_suffix(prop)
+                        if not suffix:
+                            continue
+                        prop_dir = os.path.join(c, prop["type"] + "_" + suffix)
+                        rjson = os.path.join(prop_dir, "result.json")
+                        rout = os.path.join(prop_dir, "result.out")
+                        if os.path.isfile(rjson) and os.path.getsize(rjson) > 0 \
+                                and os.path.isfile(rout) and os.path.getsize(rout) > 0:
+                            finished_list.append(prop_dir)
+                if finished_list:
+                    finished_props[c] = finished_list
+        conf_dirs = pruned
+        if finished_props:
+            prop_param["skip_finished_properties"] = [
+                [c, os.path.basename(p)] for c, lst in finished_props.items() for p in lst
+            ]
+        if not conf_dirs and not prop_param.get("skip_finished_properties", []):
+            raise RuntimeError("All properties are already finished; nothing to submit.")
+    
+    if flow_type == 'joint' and relax_param and prop_param:
+        # Split finished vs pending relaxations so we can skip reruns while still running properties
+        rerun_finished = relax_param.get("interaction", {}).get("rerun_finished", True)
+        skip_finished_properties = []
+        if rerun_finished is False:
+            finished_relax = []
+            pending_relax = []
+            for c in conf_dirs:
+                if relaxation_finished(c):
+                    finished_relax.append(c)
+                else:
+                    pending_relax.append(c)
+            if not pending_relax:
+                logging.info("All relaxations finished; joint flow will reuse existing results.")
+            # keep all structures for property stage; mark which relaxations to skip
+            relax_param["skip_finished_structures"] = finished_relax
+            prop_param["pre_relaxed_structures"] = finished_relax
+        # Detect per-structure finished properties when rerun_finished is False for that property
+        properties = prop_param.get("properties", [])
+        for c in conf_dirs:
+            for prop in properties:
+                if prop.get("rerun_finished", True):
+                    continue
+                do_refine, suffix = handle_prop_suffix(prop)
+                if not suffix:
+                    continue
+                prop_dir_name = f"{prop['type']}_{suffix}"
+                prop_dir = os.path.join(c, prop_dir_name)
+                rjson = os.path.join(prop_dir, "result.json")
+                rout = os.path.join(prop_dir, "result.out")
+                if os.path.isfile(rjson) and os.path.getsize(rjson) > 0 \
+                        and os.path.isfile(rout) and os.path.getsize(rout) > 0:
+                    skip_finished_properties.append([c, prop_dir_name])
+        if skip_finished_properties:
+            prop_param["skip_finished_properties"] = skip_finished_properties
     refine_init_name_list = []
     # backup all existing property work directories
     if flow_type in ['props', 'joint']:
@@ -73,6 +184,14 @@ def pack_upload_dir(
                     refine_init_suffix = jj['init_from_suffix']
                     refine_init_name_list.append(property_type + "_" + refine_init_suffix)
                 path_to_prop = os.path.join(ii, property_type + "_" + suffix)
+                # If rerun_finished is False and results exist, skip backing up (keep as-is)
+                if (not jj.get("rerun_finished", True)):
+                    rjson = os.path.join(path_to_prop, "result.json")
+                    rout = os.path.join(path_to_prop, "result.out")
+                    if os.path.isfile(rjson) and os.path.getsize(rjson) > 0 \
+                            and os.path.isfile(rout) and os.path.getsize(rout) > 0:
+                        logging.info(f"Skip backing up finished property at {path_to_prop} (rerun_finished=False)")
+                        continue
                 backup_path(path_to_prop)
 
     """copy necessary files and directories into temp upload directory"""
@@ -93,10 +212,13 @@ def pack_upload_dir(
         if os.path.isfile(copy_stru_path):
             target_stru_path = os.path.join(build_conf_path, "STRU")
             shutil.copy(copy_stru_path, target_stru_path)
-        if flow_type == 'props':
+        if flow_type in ['props', 'joint']:
             copy_relaxation_path = os.path.abspath(os.path.join(ii, "relaxation"))
             target_relaxation_path = os.path.join(build_conf_path, "relaxation")
-            shutil.copytree(copy_relaxation_path, target_relaxation_path)
+            if os.path.isdir(copy_relaxation_path):
+                shutil.copytree(copy_relaxation_path, target_relaxation_path)
+            else:
+                logging.warning(f"Skip copying relaxation for {ii}: {copy_relaxation_path} not found.")
             # copy refine from init path to upload dir
             if refine_init_name_list:
                 for jj in refine_init_name_list:
@@ -131,6 +253,27 @@ def submit(
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         logging.debug(msg=f'Temporary upload directory:{tmp_dir}')
+
+        # For property-only workflow, drop structures whose relaxation output is missing
+        if flow_type == 'props' and props_param:
+            filtered_structs = []
+            missing_structs = []
+            for pattern in props_param.get("structures", []):
+                matches = glob.glob(pattern)
+                if not matches:
+                    logging.warning(f'No structure matched pattern "{pattern}", skip.')
+                    continue
+                for m in matches:
+                    relax_dir = os.path.join(m, "relaxation")
+                    if os.path.isdir(relax_dir):
+                        filtered_structs.append(m)
+                    else:
+                        missing_structs.append(m)
+                        logging.warning(f'Relaxation directory missing for {m}, skip property calculation on it.')
+            if not filtered_structs:
+                raise RuntimeError("No available relaxed structures for property workflow.")
+            props_param["structures"] = filtered_structs
+
         pack_upload_dir(
             work_dir=work_dir,
             upload_dir=tmp_dir,
@@ -139,7 +282,6 @@ def submit(
             flow_type=flow_type,
             exclude_upload_files=wf_config.exclude_upload_files
         )
-
         cwd = os.getcwd()
         os.chdir(tmp_dir)
         flow_id = None
@@ -201,10 +343,23 @@ def submit_workflow(
         wf_config.submit_only = True
     # set pre-defined dflow debug mode settings
     if is_debug:
-        tmp_work_dir = tempfile.TemporaryDirectory()
+        # Prefer an explicit debug_workdir from config; otherwise, try to place
+        # the debug work under the configured remote_root (if any) to mimic the
+        # user's desired filesystem layout; fall back to a temp dir.
+        debug_dir = config_dict.get("debug_workdir")
+        if not debug_dir:
+            base_dir = wf_config.remote_root or os.getcwd()
+            # Put artifacts in a hidden folder to avoid clutter
+            debug_dir = os.path.join(base_dir, "dflow_debug")
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+        except Exception:
+            # Final fallback: system temp
+            debug_dir = tempfile.mkdtemp(prefix="apex-debug-")
         config["mode"] = "debug"
-        config["debug_workdir"] = config_dict.get("debug_workdir", tmp_work_dir.name)
+        config["debug_workdir"] = debug_dir
         logging.info(f'Debug mode activated, debug work directory: {config["debug_workdir"]}')
+        # Use local filesystem instead of object storage in debug
         s3_config["storage_client"] = None
 
     if flow_name:
@@ -222,6 +377,8 @@ def submit_workflow(
     run_command = wf_config.basic_config_dict[f"{calculator}_run_command"]
     if not run_command:
         run_command = wf_config.basic_config_dict["run_command"]
+    lammps_run_command = wf_config.basic_config_dict["lammps_run_command"]
+    phonolammps_run_command = wf_config.basic_config_dict["phonolammps_run_command"]
     post_image = make_image
     group_size = wf_config.basic_config_dict["group_size"]
     pool_size = wf_config.basic_config_dict["pool_size"]
@@ -246,6 +403,16 @@ def submit_workflow(
         executor=executor,
         upload_python_packages=upload_python_packages
     )
+
+    if props_param and (phonolammps_run_command or lammps_run_command):
+        props_param = copy.deepcopy(props_param)
+        for prop in props_param.get("properties", []):
+            if prop.get("type") in {"phonon", "gruneisen"}:
+                if phonolammps_run_command:
+                    prop["phonolammps_run_command"] = phonolammps_run_command
+            if prop.get("type") == "gruneisen" and lammps_run_command:
+                prop["lammps_run_command"] = lammps_run_command
+
     # submit the workflows
     work_dir_list = []
     for ii in work_dirs:

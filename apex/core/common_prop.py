@@ -6,11 +6,15 @@ from monty.serialization import dumpfn, loadfn
 from apex.core.calculator.calculator import make_calculator
 from apex.core.property.Elastic import Elastic
 from apex.core.property.EOS import EOS
+from apex.core.property.Cohesive import Cohesive
 from apex.core.property.Gamma import Gamma
 from apex.core.property.Interstitial import Interstitial
 from apex.core.property.Surface import Surface
 from apex.core.property.Vacancy import Vacancy
 from apex.core.property.Phonon import Phonon
+from apex.core.property.Decohesive import Decohesive
+from apex.core.property.FiniteTlatt import FiniteTlatt
+from apex.core.property.Gruneisen import Gruneisen
 from apex.core.lib.utils import create_path
 from apex.core.lib.util import collect_task
 from apex.core.lib.dispatcher import make_submission
@@ -27,6 +31,8 @@ def make_property_instance(parameters, inter_param):
     prop_type = parameters["type"]
     if prop_type == "eos":
         return EOS(parameters, inter_param)
+    elif prop_type == "cohesive":
+        return Cohesive(parameters, inter_param)
     elif prop_type == "elastic":
         return Elastic(parameters, inter_param)
     elif prop_type == "vacancy":
@@ -39,6 +45,12 @@ def make_property_instance(parameters, inter_param):
         return Gamma(parameters, inter_param)
     elif prop_type == "phonon":
         return Phonon(parameters, inter_param)
+    elif prop_type == "decohesive":
+        return Decohesive(parameters, inter_param)
+    elif prop_type == "finitetlatt":
+        return FiniteTlatt(parameters, inter_param)
+    elif prop_type == "gruneisen":
+        return Gruneisen(parameters, inter_param)
     else:
         raise RuntimeError(f"unknown APEX type {prop_type}")
 
@@ -65,7 +77,7 @@ def make_property(confs, inter_param, property_list):
             if not suffix:
                 continue
             # generate working directory like mp-xxx/eos_00 if jj['type'] == 'eos'
-            # handel the exception that the working directory exists
+            # handle the exception that the working directory exists
             # determine the suffix: from scratch or refine
 
             property_type = jj["type"]
@@ -73,6 +85,15 @@ def make_property(confs, inter_param, property_list):
             skip_mismatch = jj.get("skip_mismatch", False)
             if mismatch and skip_mismatch:
                 print("Skip mismatched structure")
+                continue
+
+            rerun_finished = jj.get("rerun_finished", True)
+            result_json = os.path.join(path_to_work, "result.json")
+            result_out = os.path.join(path_to_work, "result.out")
+            if (not rerun_finished
+                    and os.path.isfile(result_json)
+                    and os.path.isfile(result_out)):
+                print(f"Skip generating property tasks for {path_to_work} (results already exist)")
                 continue
 
             create_path(path_to_work)
@@ -149,6 +170,15 @@ def run_property(confs, inter_param, property_list, mdata):
             path_to_work = os.path.abspath(
                 os.path.join(ii, property_type + "_" + suffix)
             )
+
+            rerun_finished = jj.get("rerun_finished", True)
+            result_json = os.path.join(path_to_work, "result.json")
+            result_out = os.path.join(path_to_work, "result.out")
+            if (not rerun_finished
+                    and os.path.isfile(result_json)
+                    and os.path.isfile(result_out)):
+                print(f"Skip running property tasks for {path_to_work} (results already exist)")
+                continue
 
             work_path_list.append(path_to_work)
             tmp_task_list = glob.glob(os.path.join(path_to_work, "task.[0-9]*[0-9]"))
@@ -232,8 +262,14 @@ def post_property(confs, inter_param, property_list):
             except KeyError:
                 pass
             dumpfn(param_dict, param_json)
-            prop.compute(
-                os.path.join(path_to_work, "result.json"),
-                os.path.join(path_to_work, "result.out"),
-                path_to_work
-            )
+            rerun_finished = jj.get("rerun_finished", True)
+            result_json = os.path.join(path_to_work, "result.json")
+            result_out = os.path.join(path_to_work, "result.out")
+            if rerun_finished or not (os.path.isfile(result_json) and os.path.isfile(result_out)):
+                prop.compute(
+                    result_json,
+                    result_out,
+                    path_to_work
+                )
+            else:
+                print(f"Skip post processing property results at {path_to_work} (results already exist)")
